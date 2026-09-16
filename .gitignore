@@ -1,0 +1,50 @@
+# ============================================================
+# SkillPay.Service
+# 关键：任何含密钥的配置都不得进版本库
+# ============================================================
+
+# --- 密钥与本地配置（最高优先级）---
+appsettings.Development.json
+appsettings.Production.json
+appsettings.*.Local.json
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+
+# --- 运行期数据（SQLite 订单库）---
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# --- .NET 构建产物 ---
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+# --- 测试与覆盖率 ---
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+*.trx
+*.coverage
+
+# --- IDE / 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- 日志与临时文件 ---
+*.log
+logs/
+tmp/
+*.tmp
