@@ -230,6 +230,35 @@ bash /opt/skillpay/src/deploy/deploy.sh
 
 脚本流程：拉取最新代码 → `dotnet publish` → 重启 systemd → 健康检查。
 
+### 换上生产参数
+
+拿到真实「支付宝公钥 / SellerId / serviceId」后，用 `deploy/update-prod-config.sh` 改配置，**不需要手工编辑 JSON**：
+
+```bash
+bash /opt/skillpay/src/deploy/update-prod-config.sh \
+  --alipay-public-key "<平台导出的支付宝公钥>" \
+  --seller-id         "<2088 开头的商户 PID>" \
+  --service-id        "<服务市场真实 serviceId>" \
+  --seller-name       "技能工厂"
+```
+
+签约生效、`serviceId` 就位后，再加 `--switch-production` 切到生产网关：
+
+```bash
+bash /opt/skillpay/src/deploy/update-prod-config.sh ... --switch-production
+```
+
+脚本的两条硬约束（已实测）：
+
+| 约束 | 行为 |
+|---|---|
+| 生产网关 + `api_mock_service_id` | **拒绝写入**并退出，避免上线前最常见的事故 |
+| 未加 `--switch-production` | 写完提示「仍是沙箱网关」，不会静默切换 |
+
+**应用私钥处理方式**：脚本**不接受、不回显私钥明文**。默认原样保留文件中已有的值；
+如需换新私钥，用 `--private-key-file <路径>` 传入文件（自动剥离 PEM 头尾与换行，读完即删）。
+输出只打印长度与前缀，防止私钥进日志或终端历史。
+
 ### 公网验收结果（2026-09-16，从服务器之外的公网发起）
 
 | 路径 | 期望 | 实测 |
