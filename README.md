@@ -165,7 +165,10 @@ dotnet bin/Debug/net10.0/SkillPay.Service.dll
 node scripts/smoke-test.mjs
 ```
 
-数据库文件位于 `data/skillpay.db`（首次启动自动建表 + 建索引）。
+数据库文件位于 `appdata/skillpay.db`（首次启动自动建表 + 建索引）。
+
+> 路径原名 `data/`，已改为 `appdata/`。原因：Windows 文件系统不区分大小写，`data/` 与 C# 源码目录 `Data/` 是同一个文件夹，
+> 既会让 gitignore 误伤源码，也会把运行期数据库写进源码目录。改名为 `appdata/` 后两者彻底错开。
 
 ### 手工验证 402
 
