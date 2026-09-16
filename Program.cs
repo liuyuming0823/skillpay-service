@@ -78,7 +78,7 @@ static void ApplyGatewayEnvironmentOverrides(AipayOptions options)
 
 static string ResolveDatabasePath(IConfiguration configuration, string contentRootPath)
 {
-    string configured = configuration["Storage:DatabasePath"] ?? "data/skillpay.db";
+    string configured = configuration["Storage:DatabasePath"] ?? "appdata/skillpay.db";
     string absolute = Path.IsPathRooted(configured)
         ? configured
         : Path.Combine(contentRootPath, configured);
