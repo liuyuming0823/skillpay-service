@@ -197,23 +197,85 @@ curl -i "http://127.0.0.1:18080/v1/skills/demo-skill/result"
 
 ---
 
-## 七、下一步
+## 七、生产部署（已完成）
 
-| 步骤 | 内容 | 前置条件 |
+### 目标环境
+
+| 项 | 值 |
+|---|---|
+| 实例 | `lhins-154ixh63`（Ubuntu 22.04 LTS，广州 `ap-guangzhou-3`） |
+| 公网 IP | `111.230.145.82` |
+| 规格 | 2 核 2G / 50GB SSD / 4Mbps |
+| 运行时 | ASP.NET Core Runtime 10（另装 SDK 10.0.401 用于编译发布） |
+| 仓库 | `https://github.com/liuyuming0823/skillpay-service` |
+| 代码目录 | `/opt/skillpay/src` |
+| 发布目录 | `/opt/skillpay/app` |
+| 日志 | `/var/log/skillpay/app.log` |
+
+### 架构
+
+```
+公网 ──:80──> Nginx ──> 127.0.0.1:18080 ──> SkillPay.Service (systemd)
+```
+
+- `skillpay.service`：systemd 常驻，`Restart=always`，已 `enable` 开机自启
+- Nginx：`/etc/nginx/sites-available/skillpay` 反代到后端，已启用（`deploy/nginx-skillpay.conf`）
+
+### 幂等重部署
+
+```bash
+# 服务器上执行
+bash /opt/skillpay/src/deploy/deploy.sh
+```
+
+脚本流程：拉取最新代码 → `dotnet publish` → 重启 systemd → 健康检查。
+
+### 公网验收结果（2026-09-16，从服务器之外的公网发起）
+
+| 路径 | 期望 | 实测 |
 |---|---|---|
-| 1 | 换取真实 `AppId` / `PrivateKey` / `AlipayPublicKey` / `SellerId` | 支付宝开放平台账号 |
-| 2 | 签约入驻，拿到真实 `serviceId` | 上一步完成 |
-| 3 | 沙箱联调（当前 Windows 环境未做沙箱验证，标记为 `VERIFY_PENDING`） | 密钥就位 |
-| 4 | 部署到 Lighthouse 服务器（Ubuntu 22.04 / `111.230.145.82`） | 见下 |
+| `/healthz` | 200 | ✅ 200 |
+| `/v1/skills/demo-skill/result` | 402 | ✅ 402 + `Payment-Needed` 头 |
+| `/v1/skills/not-there/result` | 404 | ✅ 404 |
+| `/v1/skills/bad%20code/result` | 400 | ✅ 400 |
 
-### 部署待办
+### ⚠️ 域名与 HTTPS：广州地域必须备案（实测结论）
 
-- **目标框架**：本机 SDK 为 .NET 10。服务器上线前需确认 .NET 10 运行时可用性，
-  或改用 `net8.0`（LTS）以降低运行时风险。
-- **端口与防火墙**：服务器当前仅放通 22 / 80 / ICMP，**443 未放通**，上 HTTPS 前需补规则。
-- **HTTPS**：AIPAY 是出站验证模式，**不需要备案即可跑通业务逻辑**；
-  若要对外提供正式访问地址，可选「自有域名 + 备案」或「Cloudflare Tunnel（免备案）」。
-- **密钥注入**：生产密钥不走文件提交，用环境变量或服务器本地配置。
+在 80 端口使用**任意域名**（含 `111.230.145.82.sslip.io` 这类免备案解析服务）访问本实例，
+会被腾讯云强制 302 拦截：
+
+```
+HTTP/1.1 302 OK
+Location: https://dnspod.qcloud.com/static/webblock.html?d=111.230.145.82.sslip.io
+```
+
+同一时刻对照实验：
+
+| 请求 | 结果 |
+|---|---|
+| `http://111.230.145.82/healthz`（裸 IP） | ✅ 200 |
+| `http://111.230.145.82/healthz` + `Host: test.example.com` | ❌ 302 备案拦截 |
+| `http://111.230.145.82.sslip.io/healthz` | ❌ 302 备案拦截 |
+
+**结论**：广州实例上**只要请求的 Host 头带域名就会被拦，与该域名是否真实存在无关**。
+因此「免备案域名」「Let's Encrypt HTTP-01 签发」在本机均不可行。
+443 已放通，但**在没有已备案域名之前无法提供可信 HTTPS**。
+
+当前可用服务地址：`http://111.230.145.82/v1/skills/{skillCode}/result`
+
+后续若要 HTTPS，三条路：
+
+| 方案 | 需要备案 | 代价 |
+|---|---|---|
+| 广州 + 自有域名 + 备案 | 需要（约 7–20 天） | 之后可用免费证书上 HTTPS |
+| 中国香港地域另开实例 + 域名 | 不需要 | 需新增机器 |
+| 维持 IP + HTTP | 不需要 | 明文传输，支付类审核可能存疑 |
+
+### 待替换的占位配置
+
+服务器 `/opt/skillpay/app/appsettings.Production.json` 目前是**占位值**：
+沙箱网关地址、自签 RSA 密钥、`SellerId=2088000000000000`、`ServiceId=api_mock_service_id`。
+拿到真实密钥与 `serviceId` 后需替换，**应用私钥不得提交进仓库**。
 
 ---
 
