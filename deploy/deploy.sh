@@ -28,6 +28,19 @@ if [ -f "$CONFIG_FILE" ]; then
   echo "    已暂存现有生产配置"
 fi
 
+# 订单库（SQLite）落在 $APP_DIR/appdata 下，而下面要 rm -rf "$APP_DIR"。
+# 不显式搬走，每次部署都会**清空全部订单记录** —— 已付款但尚未履约的订单会直接消失，
+# 之后即使支付宝验付通过，本地也查不到订单，只能重新下发账单（钱等于白付）。
+DATA_DIR="$APP_DIR/appdata"
+DATA_BACKUP=/tmp/skillpay-appdata
+had_data=0
+if [ -d "$DATA_DIR" ]; then
+  rm -rf "$DATA_BACKUP"
+  cp -a "$DATA_DIR" "$DATA_BACKUP"
+  had_data=1
+  echo "    已暂存订单库 $(du -sh "$DATA_DIR" | cut -f1)"
+fi
+
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR" "$LOG_DIR"
 dotnet publish "$SRC_DIR/SkillPay.Service.csproj" -c Release -o "$APP_DIR" --nologo
@@ -37,6 +50,11 @@ if [ "$had_config" = "1" ]; then
   echo "    已恢复生产配置"
 else
   echo "    警告：未找到 $CONFIG_FILE —— 服务将因缺少必需配置而启动失败"
+fi
+
+if [ "$had_data" = "1" ]; then
+  cp -a "$DATA_BACKUP" "$DATA_DIR"
+  echo "    已恢复订单库"
 fi
 
 echo "==> 3/4 安装 systemd 单元"
