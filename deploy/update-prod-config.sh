@@ -12,6 +12,7 @@
 #
 # 用法（在服务器上执行）：
 #   bash update-prod-config.sh \
+#     --app-id "2021006199690483" \
 #     --alipay-public-key "MIIBIjANBgkq...AB" \
 #     --seller-id "2088xxxxxxxxxxxx" \
 #     --service-id "<服务市场真实 serviceId>" \
@@ -26,6 +27,7 @@ CONFIG="${CONFIG:-/opt/skillpay/app/appsettings.Production.json}"
 UNIT="${UNIT:-skillpay}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18080/healthz}"
 
+APP_ID=""
 ALIPAY_PUBLIC_KEY=""
 SELLER_ID=""
 SERVICE_ID=""
@@ -35,6 +37,7 @@ SWITCH_PRODUCTION=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --app-id)            APP_ID="$2"; shift 2 ;;
     --alipay-public-key) ALIPAY_PUBLIC_KEY="$2"; shift 2 ;;
     --seller-id)         SELLER_ID="$2"; shift 2 ;;
     --service-id)        SERVICE_ID="$2"; shift 2 ;;
@@ -49,6 +52,7 @@ done
 command -v python3 >/dev/null 2>&1 || { echo "服务器缺少 python3，无法安全改写 JSON。" >&2; exit 1; }
 
 export SP_CONFIG="$CONFIG"
+export SP_APP_ID="$APP_ID"
 export SP_PUBKEY="$ALIPAY_PUBLIC_KEY"
 export SP_SELLER_ID="$SELLER_ID"
 export SP_SERVICE_ID="$SERVICE_ID"
@@ -60,6 +64,7 @@ python3 <<'PY'
 import json, os, re, sys
 
 path      = os.environ["SP_CONFIG"]
+app_id    = os.environ.get("SP_APP_ID", "").strip()
 pubkey    = os.environ.get("SP_PUBKEY", "").strip()
 seller_id = os.environ.get("SP_SELLER_ID", "").strip()
 service_id= os.environ.get("SP_SERVICE_ID", "").strip()
@@ -83,6 +88,15 @@ def strip_pem(raw: str) -> str:
 
 
 changed, warnings = [], []
+
+if app_id:
+    if re.fullmatch(r"\d{16}", app_id):
+        node["AppId"] = app_id
+        changed.append("AppId")
+    else:
+        warnings.append(
+            f"AppId 应为 16 位纯数字，收到的值不符合（长度 {len(app_id)}），已跳过。"
+        )
 
 if pubkey:
     node["AlipayPublicKey"] = strip_pem(pubkey)
@@ -127,6 +141,7 @@ for w in warnings:
 
 priv = node.get("PrivateKey", "")
 print(f"  PrivateKey 长度 = {len(priv)}（内容不显示）")
+print(f"  AppId           = {node.get('AppId')}")
 print(f"  ServerUrl       = {node.get('ServerUrl')}")
 print(f"  ServiceId       = {node.get('ServiceId')}")
 print(f"  SellerId        = {str(node.get('SellerId'))[:4]}…（共 {len(str(node.get('SellerId','')))} 位）")
@@ -149,6 +164,6 @@ tail -n 12 /var/log/skillpay/app.log 2>/dev/null || echo "（暂无日志）"
 echo "=== 健康检查 ==="
 curl -s -o /dev/null -w "healthz HTTP %{http_code}\n" --max-time 6 "$HEALTH_URL" || echo "健康检查失败"
 
-echo "=== 402 端点冒烟 ==="
+echo "=== 402 端点冒烟（统一入口）==="
 curl -s -o /dev/null -w "result  HTTP %{http_code}\n" --max-time 6 \
-  "${HEALTH_URL%/healthz}/v1/skills/demo-skill/result" || echo "402 端点无响应"
+  "${HEALTH_URL%/healthz}/v1/skills/result?skill_code=demo-skill" || echo "402 端点无响应"
