@@ -32,8 +32,10 @@ public sealed class PaidAccessService
     private readonly IAlipayGateway _gateway;
     private readonly AipayOptions _aipay;
     private readonly SkillCatalogOptions _catalog;
+    private readonly GenerationOptions _generation;
     private readonly PaidResourceFactory _resources;
     private readonly TimeProvider _time;
+    private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<PaidAccessService> _logger;
 
     public PaidAccessService(
@@ -41,16 +43,20 @@ public sealed class PaidAccessService
         IAlipayGateway gateway,
         IOptions<AipayOptions> aipay,
         IOptions<SkillCatalogOptions> catalog,
+        IOptions<GenerationOptions> generation,
         PaidResourceFactory resources,
         TimeProvider time,
+        IHostApplicationLifetime lifetime,
         ILogger<PaidAccessService> logger)
     {
         _orders = orders;
         _gateway = gateway;
         _aipay = aipay.Value;
         _catalog = catalog.Value;
+        _generation = generation.Value;
         _resources = resources;
         _time = time;
+        _lifetime = lifetime;
         _logger = logger;
     }
 
@@ -291,6 +297,19 @@ public sealed class PaidAccessService
 
         var outTradeNo = outcome.OutTradeNo!;
 
+        // 关键：履约一旦开始，就与买家的 HTTP 连接脱钩。
+        // 生成可能耗时数分钟，而买家客户端（或中间的反向代理）往往等不了那么久。
+        // 若继续沿用 RequestAborted，客户端一断开，生成随之被取消、订单永远停在「未履约」——
+        // 结果是用户付了钱却拿不到东西，且重试也不会变好。
+        // 所以这里换成「应用关停 + 独立时间预算」的令牌：客户端走了，活也要干完并落库。
+        using var fulfillmentCts = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetime.ApplicationStopping);
+
+        fulfillmentCts.CancelAfter(
+            TimeSpan.FromSeconds(Math.Max(30, _generation.FulfillmentTimeoutSeconds)));
+
+        CancellationToken fulfillToken = fulfillmentCts.Token;
+
         var preparation = await _orders.PrepareFulfillmentAsync(
             new FulfillmentRequest
             {
@@ -301,7 +320,7 @@ public sealed class PaidAccessService
                 CreateResourceAsync = token =>
                     _resources.CreateAsync(resourceId, outTradeNo, skillCode, inputJson, token)
             },
-            cancellationToken);
+            fulfillToken);
 
         if (preparation is null
             || (preparation.State != FulfillStatus.PendingConfirm && preparation.State != FulfillStatus.Fulfilled)
@@ -326,7 +345,7 @@ public sealed class PaidAccessService
             return Delivered(resourceId, preparation.ServiceResult, verifyTradeNo, outTradeNo, alreadyFulfilled: true);
         }
 
-        var confirm = await _gateway.ConfirmFulfillmentAsync(verifyTradeNo, cancellationToken);
+        var confirm = await _gateway.ConfirmFulfillmentAsync(verifyTradeNo, fulfillToken);
 
         if (!confirm.ApiSucceeded)
         {
@@ -346,7 +365,7 @@ public sealed class PaidAccessService
             };
         }
 
-        await _orders.MarkFulfilledAsync(outTradeNo, verifyTradeNo, cancellationToken);
+        await _orders.MarkFulfilledAsync(outTradeNo, verifyTradeNo, fulfillToken);
 
         return Delivered(resourceId, preparation.ServiceResult, verifyTradeNo, outTradeNo, alreadyFulfilled: false);
     }

@@ -20,6 +20,16 @@ public sealed class GenerationOptions
     /// <summary>大模型配置。</summary>
     public LlmOptions Llm { get; set; } = new();
 
+    /// <summary>
+    /// 履约阶段的独立时间预算（秒）。从「验付通过」算起，超时即放弃本轮生成。
+    /// </summary>
+    /// <remarks>
+    /// 这个预算**与买家的 HTTP 连接无关**：用户已经付了钱，即使他的客户端提前挂断，
+    /// 生成也必须跑完并落库，否则重试永远拿不到东西，钱等于白付。
+    /// 取值要覆盖「大模型超时 + 落库」的最坏情况，默认 10 分钟。
+    /// </remarks>
+    public int FulfillmentTimeoutSeconds { get; set; } = 600;
+
     /// <summary>是否走大模型生成。</summary>
     public bool UseLlm =>
         string.Equals(Mode, "llm", StringComparison.OrdinalIgnoreCase) && Llm.IsConfigured;
