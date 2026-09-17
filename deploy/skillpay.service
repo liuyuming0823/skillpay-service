@@ -1,0 +1,30 @@
+[Unit]
+Description=SkillPay AIPAY 402 payment service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/skillpay/app
+
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://127.0.0.1:18080
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+Environment=DOTNET_NOLOGO=1
+
+ExecStart=/usr/bin/dotnet /opt/skillpay/app/SkillPay.Service.dll
+
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+SyslogIdentifier=skillpay
+
+StandardOutput=append:/var/log/skillpay/app.log
+StandardError=append:/var/log/skillpay/app.log
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

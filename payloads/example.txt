@@ -1,0 +1,29 @@
+这是 demo-file 技能的交付文件示例。
+
+它演示「文件交付」这条路：
+  1. 客户端请求 demo-file → 服务端下发 402 账单（1.00 元）
+  2. 客户端付款后携带 Payment-Proof 回访
+  3. 服务端验付通过 → 读取本文件 → 计算 SHA-256 → Base64 编码后返回
+  4. 客户端解码落盘，并用返回的 sha256 校验完整性
+
+要卖你自己的东西，把本文件替换成真实交付物即可，例如：
+
+  payloads/my-source-code.zip    源码包
+  payloads/my-dataset.csv        数据集
+  payloads/my-report.pdf         报告
+
+然后在 appsettings.json 里登记：
+
+  "my-product": {
+    "Price": "29.90",
+    "GoodsName": "我的源码包",
+    "Description": "……",
+    "PayloadFile": "my-source-code.zip",
+    "PayloadFileName": "my-source-code.zip",
+    "PayloadMimeType": "application/zip"
+  }
+
+注意事项：
+  · PayloadFile 只允许指向 Delivery:PayloadRoot（默认 payloads/）目录内的文件，防止路径穿越。
+  · 单次交付体积上限由 Delivery:MaxInlinePayloadBytes 控制，默认 8 MiB。
+    交付物以 Base64 内联在响应里，体积会膨胀约 1/3；更大的文件建议改用对象存储直链。
