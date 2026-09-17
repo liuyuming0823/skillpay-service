@@ -25,6 +25,9 @@ const baseUrl = process.argv[2] ?? process.env.SKILLPAY_BASE ?? 'http://127.0.0.
 const skillCode = process.env.SKILLPAY_SKILL_CODE ?? 'demo-skill';
 const paymentPath = `/v1/skills/${skillCode}/result`;
 
+/** 服务注册时登记的「服务地址」路径（统一入口，地址里不含技能编码）。 */
+const UNIFIED_PATH = '/v1/skills/result';
+
 /**
  * 参与 seller_signature 的 8 个字段，以及各自所在的账单节点。
  * 注意 goods_name / seller_id / service_id 位于 method 节点，其余位于 protocol 节点，
@@ -105,6 +108,29 @@ async function loadVerifyKey() {
   return { key: null, source: '未找到' };
 }
 
+/**
+ * 读取本地 appsettings.json 中该技能配置的单价，归一为两位小数字符串。
+ * 站点「服务单价」必须与此值一致，否则用户无法支付。
+ */
+async function loadCatalogPrice(code) {
+  const here = dirname(fileURLToPath(import.meta.url));
+
+  try {
+    const raw = JSON.parse(await readFile(join(here, '..', 'appsettings.json'), 'utf8'));
+    const price = raw?.SkillCatalog?.Skills?.[code]?.Price;
+
+    if (price === undefined || price === null || price === '') {
+      return null;
+    }
+
+    const numeric = Number(price);
+
+    return Number.isFinite(numeric) ? numeric.toFixed(2) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   console.log(`目标服务：${baseUrl}`);
   console.log(`付费端点：${paymentPath}`);
@@ -122,6 +148,36 @@ async function main() {
   check('服务信息返回 200', infoResponse.status === 200, `HTTP ${infoResponse.status}`);
   check('协议标识正确', info.protocol === 'alipay-aipay-402', `protocol=${info.protocol}`);
   check('技能目录非空', Array.isArray(info.skills) && info.skills.length > 0, `${info.skills?.length ?? 0} 个技能`);
+
+  // --- 2b. 统一入口（服务注册登记的就是这个地址） ---------------------------
+  const unified = await fetch(`${baseUrl}${UNIFIED_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ skill_code: skillCode, input: { text: 'hello' } })
+  });
+  check('统一入口 POST 返回 402', unified.status === 402, `HTTP ${unified.status}`);
+  check(
+    '统一入口带 Payment-Needed 头',
+    Boolean(unified.headers.get('payment-needed')),
+    unified.headers.get('payment-needed') ? '已下发账单' : '缺失'
+  );
+
+  const unifiedGet = await fetch(`${baseUrl}${UNIFIED_PATH}?skill_code=${encodeURIComponent(skillCode)}`);
+  check('统一入口 GET 返回 402', unifiedGet.status === 402, `HTTP ${unifiedGet.status}`);
+
+  const missingSkillCode = await fetch(`${baseUrl}${UNIFIED_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: { text: 'hello' } })
+  });
+  check('统一入口缺 skill_code 返回 400', missingSkillCode.status === 400, `HTTP ${missingSkillCode.status}`);
+
+  const unknownSkill = await fetch(`${baseUrl}${UNIFIED_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ skill_code: 'no-such-skill', input: {} })
+  });
+  check('统一入口未上架技能返回 404', unknownSkill.status === 404, `HTTP ${unknownSkill.status}`);
 
   // --- 3. 无凭据请求必须返回 402 -------------------------------------------
   const unpaid = await fetch(`${baseUrl}${paymentPath}`);
@@ -163,6 +219,20 @@ async function main() {
     unpaidBody.out_trade_no === protocol.out_trade_no,
     `body=${unpaidBody.out_trade_no}`
   );
+
+  // 站点「服务单价」与这里下发的 amount 必须相等，否则用户无法支付。
+  const catalogPrice = await loadCatalogPrice(skillCode);
+
+  if (catalogPrice === null) {
+    check('目录单价可读', false, `未在 appsettings.json 找到 ${skillCode} 的 Price`);
+  } else {
+    check(
+      '402 账单金额与目录单价一致',
+      protocol.amount === catalogPrice,
+      `账单=${protocol.amount} 目录=${catalogPrice}`
+    );
+    console.log(`        ↑ 站点「服务单价」必须填 ${Number(protocol.amount).toString()}（与账单金额一致）`);
+  }
 
   // --- 5. RSA2 签名验证 ----------------------------------------------------
   const signedPairs = Object.keys(SIGNED_FIELD_SOURCE)
