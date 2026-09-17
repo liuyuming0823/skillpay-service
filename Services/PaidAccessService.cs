@@ -55,9 +55,18 @@ public sealed class PaidAccessService
     }
 
     /// <summary>处理一次技能资源请求。</summary>
+    /// <param name="skillCode">技能编码。</param>
+    /// <param name="paymentProofHeader"><c>Payment-Proof</c> 头；为空时下发 402 账单。</param>
+    /// <param name="inputJson">
+    /// 原始请求体。仅「生成技能」用于生成内容；账单本身不携带它，
+    /// 因此调用方携带 <c>Payment-Proof</c> 重试时必须**原样重发同一请求体**，
+    /// 否则会出现「付 A 的钱、拿 B 的内容」。
+    /// </param>
+    /// <param name="cancellationToken">取消令牌。</param>
     public async Task<PaidAccessResult> ExecuteAsync(
         string skillCode,
         string? paymentProofHeader,
+        string? inputJson = null,
         CancellationToken cancellationToken = default)
     {
         var definition = _catalog.Resolve(skillCode);
@@ -89,7 +98,7 @@ public sealed class PaidAccessService
             return await IssuePaymentRequiredAsync(definition, resourceId, cancellationToken);
         }
 
-        return await VerifyAndFulfillAsync(skillCode, definition, resourceId, proof!, cancellationToken);
+        return await VerifyAndFulfillAsync(skillCode, definition, resourceId, proof!, inputJson, cancellationToken);
     }
 
     /// <summary>
@@ -208,6 +217,7 @@ public sealed class PaidAccessService
         SkillDefinition definition,
         string resourceId,
         PaymentProofData proof,
+        string? inputJson,
         CancellationToken cancellationToken)
     {
         var outcome = await _gateway.VerifyPaymentAsync(proof, cancellationToken);
@@ -288,7 +298,8 @@ public sealed class PaidAccessService
                 TradeNo = verifyTradeNo,
                 ExpectedAmount = AmountRules.Normalize(verifyAmount),
                 ExpectedResourceId = verifiedResourceId,
-                CreateResource = () => _resources.Create(resourceId, outTradeNo, skillCode)
+                CreateResourceAsync = token =>
+                    _resources.CreateAsync(resourceId, outTradeNo, skillCode, inputJson, token)
             },
             cancellationToken);
 

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -27,6 +28,16 @@ public static class SkillPayEndpoints
     /// <summary>路径式入口模板，仅作兼容保留。</summary>
     public const string PathStylePaymentPath = "/v1/skills/{skillCode}/result";
 
+    /// <summary>
+    /// 技能工厂契约入口：一次调用生成 1 个技能，计费 1 次。
+    /// </summary>
+    /// <remarks>
+    /// 与统一入口共用同一套 402 与履约逻辑，差别只在两处：
+    /// 技能编码固定为 <see cref="SkillCatalogOptions.SkillGenerationCode"/>，
+    /// 且 200 响应把产出**顶层展开**（技能工厂客户端读的是顶层字段，不是 <c>content</c> 字符串）。
+    /// </remarks>
+    public const string SkillGenerationPath = "/v1/skill/generate";
+
     private const int MaxSkillCodeLength = 64;
 
     public static IEndpointRouteBuilder MapSkillPayEndpoints(this IEndpointRouteBuilder app)
@@ -51,6 +62,7 @@ public static class SkillPayEndpoints
                 protocol = "alipay-aipay-402",
                 payment_endpoint = UnifiedPaymentPath,
                 payment_endpoint_path_style = PathStylePaymentPath,
+                skill_generation_endpoint = SkillGenerationPath,
                 payment_headers = new[] { "Payment-Needed", "Payment-Proof", "Payment-Validation" },
                 payment_request = new
                 {
@@ -88,6 +100,9 @@ public static class SkillPayEndpoints
 
         // 路径式入口：兼容既有调用方。
         app.MapGet(PathStylePaymentPath, HandlePaidResourceAsync);
+
+        // 技能工厂契约入口：一次调用 = 生成 1 个技能 = 一次计费。
+        app.MapPost(SkillGenerationPath, HandleSkillGenerationAsync);
 
         return app;
     }
@@ -140,19 +155,9 @@ public static class SkillPayEndpoints
 
         string? paymentProof = context.Request.Headers["Payment-Proof"].FirstOrDefault();
 
-        PaidAccessResult result = await service.ExecuteAsync(skillCode, paymentProof, cancellationToken);
+        PaidAccessResult result = await service.ExecuteAsync(skillCode, paymentProof, null, cancellationToken);
 
-        context.Response.StatusCode = result.StatusCode;
-        context.Response.ContentType = "application/json; charset=utf-8";
-
-        foreach (var (name, value) in result.Headers)
-        {
-            context.Response.Headers[name] = value;
-        }
-
-        await context.Response.WriteAsync(
-            JsonSerializer.Serialize(result.Payload, ProtocolJson.Options),
-            cancellationToken);
+        await WriteResultAsync(context, result, cancellationToken);
     }
 
     /// <summary>
@@ -185,6 +190,167 @@ public static class SkillPayEndpoints
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 本地联调端点：直接跑生成器，**不收费、不落库、不调支付宝**。
+    /// </summary>
+    /// <remarks>
+    /// 必须在 <c>Development</c> 环境下才注册（见 <c>Program.cs</c>），线上不存在该路径。
+    /// 存在的意义：调提示词、验证产出形状时不必每次都真付一笔钱。
+    /// 返回的是 <see cref="SkillContent"/> 原始结构，未经端点展开，便于看清生成器到底产出了什么。
+    /// </remarks>
+    public static IEndpointRouteBuilder MapSkillPayDevEndpoints(this IEndpointRouteBuilder app)
+    {
+        app.MapPost("/dev/skill/preview", async (
+            HttpContext context,
+            ISkillContentGenerator generator,
+            IOptions<SkillCatalogOptions> catalog,
+            CancellationToken cancellationToken) =>
+        {
+            string body;
+
+            using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+            {
+                body = await reader.ReadToEndAsync(cancellationToken);
+            }
+
+            if (!SkillGenerationRequest.TryParse(body, out SkillGenerationRequest request, out string error))
+            {
+                return Results.Json(
+                    new ErrorBody { Code = "INVALID_REQUEST_BODY", Message = error },
+                    ProtocolJson.Options,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            string? configuredPrice = catalog.Value
+                .Resolve(SkillCatalogOptions.SkillGenerationCode)?
+                .NormalizedPrice();
+
+            decimal price = decimal.TryParse(
+                configuredPrice,
+                System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out decimal parsed)
+                ? parsed
+                : 0m;
+
+            SkillContent content = await generator.GenerateAsync(request, price, cancellationToken);
+
+            return Results.Json(content, ProtocolJson.Options);
+        });
+
+        return app;
+    }
+
+    /// <summary>
+    /// 技能工厂契约入口。请求体字段见 <see cref="SkillGenerationRequest"/>。
+    /// </summary>
+    private static async Task HandleSkillGenerationAsync(
+        HttpContext context,
+        PaidAccessService service,
+        CancellationToken cancellationToken)
+    {
+        string body;
+
+        using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+        {
+            body = await reader.ReadToEndAsync(cancellationToken);
+        }
+
+        if (!SkillGenerationRequest.TryParse(body, out _, out string error))
+        {
+            await WriteErrorAsync(
+                context,
+                StatusCodes.Status400BadRequest,
+                "INVALID_REQUEST_BODY",
+                error,
+                cancellationToken);
+
+            return;
+        }
+
+        string? paymentProof = context.Request.Headers["Payment-Proof"].FirstOrDefault();
+
+        PaidAccessResult result = await service.ExecuteAsync(
+            SkillCatalogOptions.SkillGenerationCode,
+            paymentProof,
+            body,
+            cancellationToken);
+
+        // 只有成功交付才展开。402 与错误响应保持协议原样 —— 技能工厂只判状态码，
+        // 不解析响应体，因此 402 的形状无需为它改造。
+        object? expanded = result.StatusCode == StatusCodes.Status200OK
+            ? ExpandSkillGenerationPayload(result.Payload)
+            : null;
+
+        await WriteResultAsync(context, result, cancellationToken, expanded);
+    }
+
+    /// <summary>写出付费访问结果，<paramref name="payloadOverride"/> 非空时用它替换响应体。</summary>
+    private static async Task WriteResultAsync(
+        HttpContext context,
+        PaidAccessResult result,
+        CancellationToken cancellationToken,
+        object? payloadOverride = null)
+    {
+        context.Response.StatusCode = result.StatusCode;
+        context.Response.ContentType = "application/json; charset=utf-8";
+
+        foreach (var (name, value) in result.Headers)
+        {
+            context.Response.Headers[name] = value;
+        }
+
+        await context.Response.WriteAsync(
+            JsonSerializer.Serialize(payloadOverride ?? result.Payload, ProtocolJson.Options),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 把「生成技能」的产出顶层展开，并与协议字段合并。
+    /// </summary>
+    /// <remarks>
+    /// 统一入口把产出放在 <c>content</c>（JSON 字符串）里，而技能工厂客户端读的是响应**顶层**字段。
+    /// 选择在服务端展开而不是让技能侧解析 <c>content</c>：服务端可控，
+    /// 且技能侧不必为此发版重新上架。
+    /// </remarks>
+    private static object ExpandSkillGenerationPayload(object payload)
+    {
+        if (payload is not ResourceDeliveredBody delivered || string.IsNullOrWhiteSpace(delivered.Content))
+        {
+            return payload;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(delivered.Content);
+
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return payload;
+            }
+
+            var merged = new Dictionary<string, object?>(StringComparer.Ordinal);
+
+            foreach (JsonProperty property in document.RootElement.EnumerateObject())
+            {
+                merged[property.Name] = property.Value.Clone();
+            }
+
+            merged["resource_id"] = delivered.ResourceId;
+            merged["trade_no"] = delivered.TradeNo;
+            merged["out_trade_no"] = delivered.OutTradeNo;
+            merged["fulfillment_confirmed"] = delivered.FulfillmentConfirmed;
+            merged["already_fulfilled"] = delivered.AlreadyFulfilled;
+
+            return merged;
+        }
+        catch (JsonException)
+        {
+            // 产出不是 JSON 时原样返回：宁可能用字段少一点，也不要把可用响应变成错误。
+            return payload;
+        }
     }
 
     private static async Task WriteErrorAsync(

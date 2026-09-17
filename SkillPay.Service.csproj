@@ -7,6 +7,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 提示词规格内嵌进程序集：不落磁盘、不进技能包，是「值钱的部分」。 -->
+    <EmbeddedResource Include="Resources\skill-prompt-spec.md" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="AlipaySDKNet.Standard" Version="4.9.1369" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.12" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />

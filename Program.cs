@@ -25,6 +25,13 @@ builder.Services.AddOptions<SkillCatalogOptions>()
     .ValidateOnStart();
 
 // ---------------------------------------------------------------------------
+// 技能内容生成。提示词规格内嵌在程序集里，密钥只从环境变量注入。
+// ---------------------------------------------------------------------------
+builder.Services.AddOptions<GenerationOptions>()
+    .Bind(builder.Configuration.GetSection(GenerationOptions.SectionName))
+    .PostConfigure(ApplyGenerationEnvironmentOverrides);
+
+// ---------------------------------------------------------------------------
 // 订单持久化：SQLite 文件库。订单必须落库，禁止使用进程内存。
 // ---------------------------------------------------------------------------
 string databasePath = ResolveDatabasePath(builder.Configuration, builder.Environment.ContentRootPath);
@@ -42,6 +49,13 @@ builder.Services.AddSingleton<PaidResourceFactory>();
 builder.Services.AddSingleton<IAlipayGateway, AlipayGateway>();
 builder.Services.AddScoped<PaidAccessService>();
 
+// 生成器：模板实现始终可用（降级路径），大模型实现在凭据齐备时启用。
+// 门面按配置选择，并把大模型故障兜成模板产出 —— 用户已付款，不能空手而归。
+builder.Services.AddHttpClient(nameof(LlmSkillContentGenerator));
+builder.Services.AddSingleton<TemplateSkillContentGenerator>();
+builder.Services.AddSingleton<LlmSkillContentGenerator>();
+builder.Services.AddSingleton<ISkillContentGenerator, SkillContentGenerator>();
+
 var app = builder.Build();
 
 // ---------------------------------------------------------------------------
@@ -50,6 +64,12 @@ var app = builder.Build();
 await StartupSelfCheckAsync(app);
 
 app.MapSkillPayEndpoints();
+
+// 联调端点只在 Development 环境存在：线上不暴露任何绕过付费的生成入口。
+if (app.Environment.IsDevelopment())
+{
+    app.MapSkillPayDevEndpoints();
+}
 
 app.Run();
 
@@ -64,6 +84,24 @@ static void ApplyGatewayEnvironmentOverrides(AipayOptions options)
     // 密钥常以单行环境变量注入，允许用字面量 \n 表示换行。
     Apply("ALIPAY_PRIVATE_KEY", value => options.PrivateKey = value.Replace("\\n", "\n", StringComparison.Ordinal));
     Apply("ALIPAY_PUBLIC_KEY", value => options.AlipayPublicKey = value.Replace("\\n", "\n", StringComparison.Ordinal));
+
+    static void Apply(string name, Action<string> setter)
+    {
+        string? value = Environment.GetEnvironmentVariable(name);
+
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            setter(value.Trim());
+        }
+    }
+}
+
+static void ApplyGenerationEnvironmentOverrides(GenerationOptions options)
+{
+    Apply("GENERATION_MODE", value => options.Mode = value);
+    Apply("LLM_BASE_URL", value => options.Llm.BaseUrl = value);
+    Apply("LLM_API_KEY", value => options.Llm.ApiKey = value);
+    Apply("LLM_MODEL", value => options.Llm.Model = value);
 
     static void Apply(string name, Action<string> setter)
     {
@@ -126,6 +164,14 @@ static async Task StartupSelfCheckAsync(WebApplication app)
         db.Database.GetDbConnection().DataSource,
         catalog.Skills.Count,
         string.Join(", ", catalog.Skills.Keys));
+
+    GenerationOptions generation = provider.GetRequiredService<IOptions<GenerationOptions>>().Value;
+
+    logger.LogInformation(
+        "内容生成：模式={Mode} 模型={Model} 凭据齐备={Configured}（凭据缺失时大模型模式会自动降级为模板）",
+        generation.Mode,
+        generation.Llm.Model,
+        generation.Llm.IsConfigured);
 
     if (!aipay.IsExactSandboxMode)
     {

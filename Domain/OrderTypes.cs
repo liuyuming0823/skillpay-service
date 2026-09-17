@@ -31,8 +31,14 @@ public sealed record FulfillmentRequest
     public required string ExpectedAmount { get; init; }
     public required string ExpectedResourceId { get; init; }
 
-    /// <summary>资源生成器。仅在订单首次进入履约时调用一次。</summary>
-    public required Func<string> CreateResource { get; init; }
+    /// <summary>
+    /// 资源生成器。仅在订单首次进入履约时调用一次。
+    /// </summary>
+    /// <remarks>
+    /// 返回 <see cref="Task{TResult}"/> 而非同步结果：生成可能涉及外部调用（大模型），
+    /// 耗时可达数十秒。调用方会在**数据库事务之外**执行它，避免长耗时生成占住写锁。
+    /// </remarks>
+    public required Func<CancellationToken, Task<string>> CreateResourceAsync { get; init; }
 }
 
 /// <summary>

@@ -60,15 +60,14 @@ public sealed class EfOrderRepository : IOrderRepository
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
-
+        // 第一段：只读校验。生成可能涉及大模型调用（数十秒），
+        // 因此绝不能放在事务里 —— SQLite 会长时间持有写锁，阻塞其他订单。
         var record = await _db.Orders
             .FirstOrDefaultAsync(o => o.OutTradeNo == request.OutTradeNo, cancellationToken);
 
         if (record is null)
         {
             _logger.LogWarning("履约准备失败：订单不存在 outTradeNo={OutTradeNo}", request.OutTradeNo);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
 
@@ -77,7 +76,6 @@ public sealed class EfOrderRepository : IOrderRepository
             _logger.LogWarning(
                 "履约准备失败：资源标识不匹配 outTradeNo={OutTradeNo} 本地={Local} 期望={Expected}",
                 request.OutTradeNo, record.ResourceId, request.ExpectedResourceId);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
 
@@ -85,7 +83,6 @@ public sealed class EfOrderRepository : IOrderRepository
         if (!string.IsNullOrEmpty(record.ServiceResult) &&
             (record.FulfillStatus == FulfillStatus.PendingConfirm || record.FulfillStatus == FulfillStatus.Fulfilled))
         {
-            await transaction.CommitAsync(cancellationToken);
             return new FulfillmentPreparation
             {
                 State = record.FulfillStatus,
@@ -98,7 +95,6 @@ public sealed class EfOrderRepository : IOrderRepository
             _logger.LogWarning(
                 "履约准备失败：履约状态非法 outTradeNo={OutTradeNo} fulfillStatus={FulfillStatus}",
                 request.OutTradeNo, record.FulfillStatus);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
 
@@ -107,7 +103,6 @@ public sealed class EfOrderRepository : IOrderRepository
             _logger.LogWarning(
                 "履约准备失败：订单状态非法 outTradeNo={OutTradeNo} orderStatus={OrderStatus}",
                 request.OutTradeNo, record.OrderStatus);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
 
@@ -118,17 +113,20 @@ public sealed class EfOrderRepository : IOrderRepository
             _logger.LogWarning(
                 "履约准备失败：订单已绑定其他交易 outTradeNo={OutTradeNo} 既有交易={Existing} 本次交易={Incoming}",
                 request.OutTradeNo, record.TradeNo, request.TradeNo);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
 
-        var generated = request.CreateResource();
+        // 第二段：生成资源。在事务之外执行，耗尽时间也不锁库。
+        string generated = await request.CreateResourceAsync(cancellationToken);
+
         if (string.IsNullOrWhiteSpace(generated))
         {
             _logger.LogError("履约准备失败：资源生成器返回空内容 outTradeNo={OutTradeNo}", request.OutTradeNo);
-            await transaction.RollbackAsync(cancellationToken);
             return null;
         }
+
+        // 第三段：短事务内落库。
+        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
 
         record.ServiceResult = generated;
         record.TradeNo = request.TradeNo;

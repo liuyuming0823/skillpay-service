@@ -9,6 +9,12 @@ public sealed class SkillCatalogOptions
 {
     public const string SectionName = "SkillCatalog";
 
+    /// <summary>
+    /// 「生成技能」技能的固定编码。对外契约路径为 <c>POST /v1/skill/generate</c>，
+    /// 内部仍复用统一的 402 与履约流程，因此需要在目录里登记一个对应条目。
+    /// </summary>
+    public const string SkillGenerationCode = "skill-generate";
+
     /// <summary>资源标识前缀，用于区分同一服务下的不同资源命名空间。</summary>
     public string ResourceIdPrefix { get; set; } = "skillpay";
 
