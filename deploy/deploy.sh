@@ -31,6 +31,15 @@ BRANCH="${SKILLPAY_BRANCH:-release/source-v1.0.0}"
 
 echo "==> 1/4 拉取最新代码（分支 $BRANCH）"
 git -C "$SRC_DIR" fetch --all --prune
+
+# 再按显式 refspec 拉一次目标分支，**不要**只依赖上面那条 --all。
+# 原因（2026-09-18 实际踩到）：仓库的 remote.origin.fetch 若被收窄成只映射 main
+#     fetch = +refs/heads/main:refs/remotes/origin/main
+# 那么 "origin/release/source-v1.0.0" 这个 ref 从不被创建，下面的 reset 会把
+# 参数当成路径而失败；旧脚本写死 origin/main 时更糟 —— 每次都把「交付版」
+# 静默覆盖成「生成版」，健康检查照样通过、systemd 照样 active，
+# 但买家付款后拿到的是占位内容。显式 refspec 能绕开这个配置陷阱。
+git -C "$SRC_DIR" fetch --prune origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
 git -C "$SRC_DIR" reset --hard "origin/$BRANCH"
 
 # 交付能力自检：目标提交必须自带 DeliveryOptions，否则立刻中止。

@@ -12,4 +12,12 @@
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 技能包自更新目录（SkillUpdate:PackageRoot）。
+         不加这段，publish 不会把 skills/ 复制到应用目录，
+         于是 /v1/skills/<code>/package 会报「包文件不存在」——
+         配置里登记了技能、运行时却取不到包，是个很难发现的半通状态。 -->
+    <Content Include="skills/*.zip" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
