@@ -19,6 +19,15 @@ public sealed record OrderSnapshot
 
     /// <summary>已持久化的资源内容；未生成前为 <c>null</c>。</summary>
     public string? ServiceResult { get; init; }
+
+    /// <summary>交付物版本号；未履约前为 <c>null</c>，履约后固定不再变更。</summary>
+    public string? DeliveredVersion { get; init; }
+
+    /// <summary>首次履约时登记的买家会话标识；本特性上线前的历史订单为 <c>null</c>。</summary>
+    public string? ClientSession { get; init; }
+
+    /// <summary>会话标识的登记时间。</summary>
+    public DateTimeOffset? ClientSessionBoundAt { get; init; }
 }
 
 /// <summary>
@@ -30,6 +39,19 @@ public sealed record FulfillmentRequest
     public required string TradeNo { get; init; }
     public required string ExpectedAmount { get; init; }
     public required string ExpectedResourceId { get; init; }
+
+    /// <summary>
+    /// 本次取货请求携带的买家会话标识（<c>Payment-Proof.method.client_session</c>）。
+    /// </summary>
+    /// <remarks>
+    /// 首次履约时会被登记到订单上；之后每次取货都用它比对，判断「取货人是否就是付款人」。
+    /// </remarks>
+    public string? ClientSession { get; init; }
+
+    /// <summary>
+    /// 本次交付的产物版本号。落库后即冻结，用于对账与版本统计。
+    /// </summary>
+    public string? PayloadVersion { get; init; }
 
     /// <summary>
     /// 资源生成器。仅在订单首次进入履约时调用一次。
@@ -49,6 +71,9 @@ public sealed record FulfillmentPreparation
 {
     public required string State { get; init; }
     public required string ServiceResult { get; init; }
+
+    /// <summary>本订单实际交付的产物版本号；历史数据可能为空。</summary>
+    public string? DeliveredVersion { get; init; }
 }
 
 /// <summary>
@@ -63,6 +88,15 @@ public interface IOrderRepository
 
     /// <summary>按商户订单号查询订单；不存在返回 <c>null</c>。</summary>
     Task<OrderSnapshot?> FindByOutTradeNoAsync(string outTradeNo, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 按支付宝交易号查询订单；不存在返回 <c>null</c>。
+    /// </summary>
+    /// <remarks>
+    /// 重取链路里必须先按交易号找到已交付订单，才能走「不重复验付」的快路径。
+    /// 交易号上有唯一索引，因此最多命中一条。
+    /// </remarks>
+    Task<OrderSnapshot?> FindByTradeNoAsync(string tradeNo, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 原子地准备履约：首次进入时生成并落库资源，已进入履约时复用既有结果。

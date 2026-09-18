@@ -25,5 +25,12 @@
       "SignType": "RSA2",
       "PayWindowMinutes": 30
     }
+  },
+
+  "//5": "SkillCatalog：资源目录。ResourceIdPrefix 是「订单身份」的一部分 —— 资源标识 = <前缀>:<资源编码>，建单时写进订单。",
+  "//6": "重取产物时会拿订单里存的前缀与当前配置比对；前缀不一致，所有已付订单都会取不到货（404 RESOURCE_MISMATCH）。",
+  "//7": "本服务历史订单绑定的是 paysvc —— 与历史订单绑定，不要改成别的值。Skills 段按现场实际资源填，见 README §5.2。",
+  "SkillCatalog": {
+    "ResourceIdPrefix": "paysvc"
   }
 }

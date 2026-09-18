@@ -31,6 +31,11 @@ public sealed class SkillPayDbContext : DbContext
         order.Property(o => o.TradeNo).HasMaxLength(64);
         order.Property(o => o.ServiceResult);
 
+        // 交付版本号很短（v1.0.0 一类），64 足够；会话标识给足余量，
+        // 支付宝若调整长度也不至于把值截断 —— 截断会让身份比对误判为不一致。
+        order.Property(o => o.DeliveredVersion).HasMaxLength(64);
+        order.Property(o => o.ClientSession).HasMaxLength(256);
+
         // 同一笔支付宝交易只能履约一次。SQLite 的唯一索引允许多个 NULL，
         // 因此未进入履约的订单不受影响。
         order.HasIndex(o => o.TradeNo).IsUnique();

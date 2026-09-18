@@ -60,6 +60,31 @@ public sealed class SkillDefinition
     /// </remarks>
     public string? PayloadText { get; set; }
 
+    /// <summary>
+    /// 交付物版本号，例如 <c>v1.0.0</c>。
+    /// </summary>
+    /// <remarks>
+    /// 这是实现「<b>产物按订单冻结</b>」的显式依据：履约时把当时的版本号写进订单，
+    /// 此后无论 <see cref="PayloadFile"/> 换成了哪一版，同一订单重取拿到的永远是当初交付的那一份。
+    /// <para>
+    /// 同一资源做多版本时，把新旧文件都留在 <see cref="DeliveryOptions.PayloadRoot"/> 下，
+    /// 只改本字段与 <see cref="PayloadFile"/> 指向新文件即可 —— 老订单不受影响，新订单拿新版。
+    /// 这样「同一订单稳定、不同订单可以不同」两件事同时成立。
+    /// </para>
+    /// </remarks>
+    public string? PayloadVersion { get; set; }
+
+    /// <summary>
+    /// 交付物版本号；未显式配置时按 <see cref="PayloadFile"/> 的文件名（去扩展名）推断，
+    /// 因此不做多版本管理的历史配置也能拿到一个可读的版本标识。
+    /// </summary>
+    public string ResolvePayloadVersion() =>
+        !string.IsNullOrWhiteSpace(PayloadVersion)
+            ? PayloadVersion!.Trim()
+            : string.IsNullOrWhiteSpace(PayloadFile)
+                ? string.Empty
+                : Path.GetFileNameWithoutExtension(PayloadFile);
+
     /// <summary>校验并返回规范化后的金额。</summary>
     public string NormalizedPrice() => AmountRules.Normalize(Price);
 

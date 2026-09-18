@@ -7,6 +7,12 @@
 appsettings.Development.json
 appsettings.Production.json
 appsettings.*.Local.json
+# 回归验证脚本（ym-skillpay-server-verify）临时生成，跑完会自动删；忽略以防误提交
+appsettings.Verify.json
+
+# Python 编译缓存（pack-dist.py / pack-skill.py 运行后产生）
+__pycache__/
+*.pyc
 *.pem
 *.key
 *.p12
@@ -51,3 +57,9 @@ Thumbs.db
 logs/
 tmp/
 *.tmp
+
+# --- 交付包产物（scripts/pack-dist.py 的输出目录）---
+# 二进制包每次打包都会变，进版本库只会让仓库持续膨胀。
+# 版本追溯靠三样东西：包名里的版本号、包 sha256、部署时写入配置的 PayloadVersion。
+# 注：dist/ 下 v1.0.0 那个包在加这条规则之前就已被跟踪，保持原状不动。
+dist/

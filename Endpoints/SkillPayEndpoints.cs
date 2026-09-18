@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -26,6 +27,12 @@ public static class SkillPayEndpoints
 
     /// <summary>路径式入口模板。</summary>
     public const string PathStylePaymentPath = "/v1/skills/{skillCode}/result";
+
+    /// <summary>技能包版本清单（公开、免鉴权）。</summary>
+    public const string SkillManifestPath = "/v1/skills/{skillCode}/manifest";
+
+    /// <summary>技能包下载（公开、免鉴权）。</summary>
+    public const string SkillPackagePath = "/v1/skills/{skillCode}/package";
 
     private const int MaxSkillCodeLength = 64;
 
@@ -89,6 +96,12 @@ public static class SkillPayEndpoints
 
         // 路径式入口：地址自含资源编码。
         app.MapGet(PathStylePaymentPath, HandlePaidResourceAsync);
+
+        // 技能包自更新：公开通道，既不收费也不鉴权。
+        // 取货器（技能包）旧了会取不到货，卡住的是用户而不是收入，所以这里不设门槛；
+        // 付费门槛只在交付物上，见 /v1/skills/{skillCode}/result。
+        app.MapGet(SkillManifestPath, HandleSkillManifestAsync);
+        app.MapGet(SkillPackagePath, HandleSkillPackageAsync);
 
         return app;
     }
@@ -231,6 +244,191 @@ public static class SkillPayEndpoints
             JsonSerializer.Serialize(new ErrorBody { Code = code, Message = message }, ProtocolJson.Options),
             cancellationToken);
     }
+
+    /// <summary>
+    /// 技能包版本清单：告诉客户端「最新版是多少、要不要强制更新、去哪拿」。
+    /// </summary>
+    /// <remarks>
+    /// 刻意**只返回元信息、不返回包内容**：客户端据此判断是否需要下载，
+    /// 也让「检查有没有新版」这件事是一个极轻的请求。
+    /// <para>
+    /// 分级处置由客户端按两个字段自行判定，服务端只描述事实、不替客户端下判断：
+    /// <c>version</c> 是最新版，<c>min_supported_version</c> 是可用的下限。
+    /// </para>
+    /// </remarks>
+    private static async Task HandleSkillManifestAsync(
+        HttpContext context,
+        string skillCode,
+        IOptions<SkillUpdateOptions> skillUpdate,
+        IHostEnvironment environment,
+        CancellationToken cancellationToken)
+    {
+        if (!TryResolveSkillPackage(skillUpdate.Value, environment, skillCode, out SkillPackageDefinition? definition, out string path, out string failureCode, out string failureMessage))
+        {
+            await WriteErrorAsync(context, StatusCodeFor(failureCode), failureCode, failureMessage, cancellationToken);
+            return;
+        }
+
+        byte[] bytes = await File.ReadAllBytesAsync(path, cancellationToken);
+
+        var manifest = new
+        {
+            skill_code = skillCode,
+            version = definition!.Version,
+            min_supported_version = definition.MinSupportedVersion,
+            file_name = definition.ResolveFileName(),
+            size_bytes = bytes.LongLength,
+            sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(),
+            package_url = BuildPackageUrl(context, skillUpdate.Value, skillCode),
+            notes = definition.Notes,
+            published_at = File.GetLastWriteTimeUtc(path).ToString("o")
+        };
+
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        context.Response.ContentType = "application/json; charset=utf-8";
+
+        // 清单必须反映最新版本，任何中间层缓存都会让客户端长期停在旧版。
+        context.Response.Headers.CacheControl = "no-store";
+
+        await context.Response.WriteAsync(
+            JsonSerializer.Serialize(manifest, ProtocolJson.Options),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 下载技能包本体。
+    /// </summary>
+    /// <remarks>
+    /// 与清单一起给出 <c>X-Package-Version</c> 与 <c>X-Package-Sha256</c>，
+    /// 便于客户端边下边校验；<c>sha256</c> 同时用作 <c>ETag</c>，内容没变时可省一次传输。
+    /// </remarks>
+    private static async Task HandleSkillPackageAsync(
+        HttpContext context,
+        string skillCode,
+        IOptions<SkillUpdateOptions> skillUpdate,
+        IHostEnvironment environment,
+        CancellationToken cancellationToken)
+    {
+        if (!TryResolveSkillPackage(skillUpdate.Value, environment, skillCode, out SkillPackageDefinition? definition, out string path, out string failureCode, out string failureMessage))
+        {
+            await WriteErrorAsync(context, StatusCodeFor(failureCode), failureCode, failureMessage, cancellationToken);
+            return;
+        }
+
+        byte[] bytes = await File.ReadAllBytesAsync(path, cancellationToken);
+        string sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        string etag = $"\"{sha256}\"";
+
+        // 客户端可能带 If-None-Match 来确认「我这份是不是最新的」，命中就省掉这次传输。
+        if (string.Equals(context.Request.Headers.IfNoneMatch.FirstOrDefault(), etag, StringComparison.Ordinal))
+        {
+            context.Response.StatusCode = StatusCodes.Status304NotModified;
+            return;
+        }
+
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        context.Response.ContentType = "application/zip";
+        context.Response.Headers.ETag = etag;
+        context.Response.Headers["X-Package-Version"] = definition!.Version;
+        context.Response.Headers["X-Package-Sha256"] = sha256;
+
+        await context.Response.Body.WriteAsync(bytes, cancellationToken);
+    }
+
+    /// <summary>
+    /// 定位技能包：登记检查 → 路径解析（含越界防护）→ 文件存在性检查。
+    /// </summary>
+    /// <remarks>
+    /// 三个失败原因用不同的码分开，是为了让客户端/运维一眼看出该改配置还是该传包，
+    /// 而不是笼统回一个 500。
+    /// </remarks>
+    private static bool TryResolveSkillPackage(
+        SkillUpdateOptions options,
+        IHostEnvironment environment,
+        string skillCode,
+        out SkillPackageDefinition? definition,
+        out string path,
+        out string failureCode,
+        out string failureMessage)
+    {
+        definition = null;
+        path = string.Empty;
+        failureCode = string.Empty;
+        failureMessage = string.Empty;
+
+        definition = options.Resolve(skillCode);
+
+        if (definition is null || string.IsNullOrWhiteSpace(definition.PackageFile))
+        {
+            failureCode = "SKILL_PACKAGE_NOT_REGISTERED";
+            failureMessage = $"技能 {skillCode} 未登记技能包，无法自更新。";
+            return false;
+        }
+
+        try
+        {
+            path = ResolvePackagePath(options, environment, definition.PackageFile);
+        }
+        catch (InvalidOperationException ex)
+        {
+            failureCode = "SKILL_PACKAGE_PATH_INVALID";
+            failureMessage = ex.Message;
+            return false;
+        }
+
+        if (!File.Exists(path))
+        {
+            failureCode = "SKILL_PACKAGE_MISSING";
+            failureMessage = $"技能 {skillCode} 的包文件不存在：{definition.PackageFile}。请检查 SkillUpdate:PackageRoot 配置。";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>把配置里的相对路径解析成绝对路径，并强制它落在 <see cref="SkillUpdateOptions.PackageRoot"/> 内。</summary>
+    private static string ResolvePackagePath(
+        SkillUpdateOptions options,
+        IHostEnvironment environment,
+        string relative)
+    {
+        string root = Path.GetFullPath(
+            Path.Combine(environment.ContentRootPath, options.PackageRoot));
+
+        string full = Path.GetFullPath(
+            Path.IsPathRooted(relative) ? relative : Path.Combine(root, relative));
+
+        string prefix = root.EndsWith(Path.DirectorySeparatorChar)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+
+        // 穿越防护：路径必须落在 PackageRoot 之内，否则配置写错就能下发任意文件。
+        if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"技能包路径越界：{relative}。只允许 SkillUpdate:PackageRoot 目录内的文件。");
+        }
+
+        return full;
+    }
+
+    /// <summary>拼出客户端可直接下载的绝对地址。</summary>
+    private static string BuildPackageUrl(HttpContext context, SkillUpdateOptions options, string skillCode)
+    {
+        // 生产上务必显式配置 PublicBaseUrl：反代后面按请求推断会拿到内网地址或错误协议。
+        string baseUrl = !string.IsNullOrWhiteSpace(options.PublicBaseUrl)
+            ? options.PublicBaseUrl!.Trim().TrimEnd('/')
+            : $"{context.Request.Scheme}://{context.Request.Host}";
+
+        return $"{baseUrl}/v1/skills/{Uri.EscapeDataString(skillCode)}/package";
+    }
+
+    private static int StatusCodeFor(string failureCode) => failureCode switch
+    {
+        "SKILL_PACKAGE_NOT_REGISTERED" => StatusCodes.Status404NotFound,
+        "SKILL_PACKAGE_MISSING" => StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
 
     private static bool IsValidSkillCode(string skillCode)
     {

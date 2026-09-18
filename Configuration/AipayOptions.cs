@@ -67,6 +67,21 @@ public sealed class AipayOptions
     public int PayWindowMinutes { get; set; } = 30;
 
     /// <summary>
+    /// 取货身份校验模式。
+    /// </summary>
+    /// <remarks>
+    /// 订单号与交易号都会随付款流程公开流转，谁拿到谁就能换货 —— 这是「一单泄露、全量泄露」的根因。
+    /// 支付宝在 <c>Payment-Proof</c> 里已经递来了 <c>client_session</c>（官方定义为
+    /// 「买家客户端会话标识，用于验证买家一致性」），本开关决定服务端要不要真的拿它做判断。
+    /// <list type="bullet">
+    ///   <item><c>Observe</c>（默认）：只记录不拦截，交付行为与改造前逐字节一致，用于收集判定依据。</item>
+    ///   <item><c>Enforce</c>：会话与订单登记值不一致即拒绝，返回 403。</item>
+    /// </list>
+    /// 上线顺序应当是「先 Observe 跑几天，确认日志里没有正常买家被误判，再切 Enforce」。
+    /// </remarks>
+    public string ClaimIdentityMode { get; set; } = ClaimIdentityModes.Observe;
+
+    /// <summary>
     /// 精确沙箱模式：仅当网关是沙箱网关且 serviceId 仍是 mock 值时成立。
     /// 该模式下支付宝应答可能不含 amount / resource_id / trade_no，允许按本地订单回填。
     /// </summary>
@@ -77,6 +92,34 @@ public sealed class AipayOptions
     /// <summary>是否指向生产网关。生产网关不得与 mock serviceId 混用。</summary>
     public bool IsProductionGateway =>
         string.Equals(ServerUrl, ProductionGateway, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// 取货身份校验模式的取值与判定。
+/// </summary>
+/// <remarks>
+/// 独立成类型而不是散落的字符串比较：模式名一旦在某处拼错，
+/// 默认分支会静默退化成「放行」，而这个默认值恰好是安全侧最弱的一档。
+/// </remarks>
+public static class ClaimIdentityModes
+{
+    /// <summary>观察模式：只记录日志，不影响交付。</summary>
+    public const string Observe = "Observe";
+
+    /// <summary>强制模式：身份不一致即拒绝取货。</summary>
+    public const string Enforce = "Enforce";
+
+    /// <summary>是否处于强制模式。取值非法时按「非强制」处理，与默认值一致。</summary>
+    public static bool IsEnforce(string? mode) =>
+        string.Equals(mode, Enforce, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>是否处于观察模式。</summary>
+    public static bool IsObserve(string? mode) => !IsEnforce(mode);
+
+    /// <summary>取值是否合法。仅用于启动期校验。</summary>
+    public static bool IsKnown(string? mode) =>
+        string.Equals(mode, Observe, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(mode, Enforce, StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -110,6 +153,13 @@ public sealed class AipayOptionsValidator : IValidateOptions<AipayOptions>
         if (options.PayWindowMinutes is < 1 or > 1440)
         {
             failures.Add($"{AipayOptions.SectionName}:PayWindowMinutes 必须在 1-1440 之间。");
+        }
+
+        // 拼错的模式名会静默退化成「不校验」，属于安全配置事故，启动期就拦下来。
+        if (!ClaimIdentityModes.IsKnown(options.ClaimIdentityMode))
+        {
+            failures.Add(
+                $"{AipayOptions.SectionName}:ClaimIdentityMode 只能是 {ClaimIdentityModes.Observe} 或 {ClaimIdentityModes.Enforce}。");
         }
 
         ValidatePrivateKeyFormat(options, failures);

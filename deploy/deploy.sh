@@ -6,6 +6,18 @@
 #
 # 做四件事：拉最新代码 → 发布到 /opt/skillpay/app → 安装 systemd 单元 → 健康检查
 # 注意：会保留 appsettings.Production.json（生产密钥不在仓库里，必须原地保留）
+#
+# ⚠️ 部署分支 = release/source-v1.0.0（交付版），**不是 main**。
+#    main 是「LLM 技能生成版」：它没有 Configuration/DeliveryOptions.cs，
+#    PaidResourceFactory 也不认 PayloadFile。而本服务的产物交付完全依赖
+#        Delivery:PayloadRoot            （产物所在目录）
+#        SkillCatalog:Skills.<code>.PayloadFile（产物文件名）
+#    把 main 部署上来，appsettings.Production.json 里的 PayloadFile 会退化成一句
+#    无效配置：**健康检查照样 OK、systemd 照样 active**，但买家付款后拿到的是
+#    占位内容而不是源码包 —— 静默失败，比启动失败难发现得多。
+#    脚本已在发布前加了交付能力自检（见 1/4 步），目标分支缺能力会直接中止。
+#
+#    临时部署其他分支：SKILLPAY_BRANCH=<分支名> bash deploy/deploy.sh
 
 set -euo pipefail
 
@@ -15,10 +27,22 @@ LOG_DIR=/var/log/skillpay
 CONFIG_FILE="$APP_DIR/appsettings.Production.json"
 BACKUP_FILE=/tmp/skillpay-prod-config.json
 PORT=18080
+BRANCH="${SKILLPAY_BRANCH:-release/source-v1.0.0}"
 
-echo "==> 1/4 拉取最新代码"
+echo "==> 1/4 拉取最新代码（分支 $BRANCH）"
 git -C "$SRC_DIR" fetch --all --prune
-git -C "$SRC_DIR" reset --hard origin/main
+git -C "$SRC_DIR" reset --hard "origin/$BRANCH"
+
+# 交付能力自检：目标提交必须自带 DeliveryOptions，否则立刻中止。
+# 放在最前面是有意的 —— 此时还没碰 APP_DIR，中止不产生任何副作用。
+if ! git -C "$SRC_DIR" cat-file -e "HEAD:Configuration/DeliveryOptions.cs" 2>/dev/null; then
+  echo "FATAL  分支 $BRANCH 不含产物交付能力（缺 Configuration/DeliveryOptions.cs）。"
+  echo "       产物交付依赖 Delivery:PayloadRoot 与 SkillCatalog:Skills.<code>.PayloadFile；"
+  echo "       部署「生成版」会让健康检查通过、但买家拿到占位内容。"
+  echo "       已中止，$APP_DIR 未被改动。当前 src HEAD:"
+  git -C "$SRC_DIR" log --oneline -1
+  exit 1
+fi
 
 echo "==> 2/4 发布到 $APP_DIR"
 had_config=0

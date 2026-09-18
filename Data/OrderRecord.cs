@@ -35,6 +35,28 @@ public sealed class OrderRecord
     /// <summary>已生成的资源内容，用于重试时返回一致结果。</summary>
     public string? ServiceResult { get; set; }
 
+    /// <summary>
+    /// 交付物版本号，履约时写入并<b>此后不再变更</b>。
+    /// </summary>
+    /// <remarks>
+    /// 产物本身已随 <see cref="ServiceResult"/> 落库，因此「按订单冻结」在数据上是天然成立的；
+    /// 本列把它**显式化**，用于对账、客服排查，以及日后按版本统计交付量。
+    /// </remarks>
+    public string? DeliveredVersion { get; set; }
+
+    /// <summary>
+    /// 首次履约时登记的买家会话标识（<c>Payment-Proof.method.client_session</c>）。
+    /// </summary>
+    /// <remarks>
+    /// 只在首次履约时写入，且**不覆盖**：那一刻请求方刚被支付宝验付通过，
+    /// 是「谁付的钱」最可信的一次记录。此后取货都拿它做一致性比对。
+    /// 本特性上线前的历史订单该列为 <c>NULL</c>，判定时按「无从判定」放行。
+    /// </remarks>
+    public string? ClientSession { get; set; }
+
+    /// <summary>会话标识的登记时间。</summary>
+    public DateTimeOffset? ClientSessionBoundAt { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public DateTimeOffset? FulfilledAt { get; set; }

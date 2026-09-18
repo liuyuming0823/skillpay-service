@@ -133,6 +133,9 @@ public sealed class PaidResourceFactory
             delivery = new
             {
                 type = "file_base64",
+                // 交付当时的版本号，随产物一起落库。
+                // 订单重取时返回的是落库内容，因此客户端拿到的版本永远与首次交付一致。
+                payload_version = definition.ResolvePayloadVersion(),
                 file_name = ResolveFileName(definition, path),
                 mime_type = ResolveMimeType(definition, path),
                 size_bytes = bytes.LongLength,
@@ -164,6 +167,7 @@ public sealed class PaidResourceFactory
             delivery = new
             {
                 type = "text",
+                payload_version = definition.ResolvePayloadVersion(),
                 file_name = definition.PayloadFileName ?? $"{skillCode}.txt",
                 mime_type = definition.PayloadMimeType ?? "text/plain; charset=utf-8",
                 size_bytes = bytes.LongLength,

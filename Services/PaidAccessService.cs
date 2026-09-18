@@ -226,6 +226,61 @@ public sealed class PaidAccessService
         string? inputJson,
         CancellationToken cancellationToken)
     {
+        // ------------------------------------------------------------------
+        // 快路径：订单已交付过时，不再重复验付，只校验「取货人 == 付款人」。
+        //
+        // 为什么必须放在验付之前：
+        //   1) 支付宝对同一笔交易的**二次验付**会返回 40004 SYSTEM_ERROR，
+        //      把「凭原凭据重取」这件事本身挡死（2026-09-18 实测）；
+        //   2) 已交付订单的合法性在首次验付时已确认，产物就在库里，
+        //      重验既无增量信息，又把重取的成功率押在支付宝的幂等行为上。
+        //
+        // 顺带钉死「产物按订单冻结」：这里返回的是当初落库的那一份，
+        // 与 payloads/ 目录下当前放的是哪个版本完全无关。
+        // ------------------------------------------------------------------
+        var existing = await _orders.FindByTradeNoAsync(proof.TradeNo, cancellationToken);
+
+        if (existing is not null
+            && existing.FulfillStatus == FulfillStatus.Fulfilled
+            && !string.IsNullOrWhiteSpace(existing.ServiceResult))
+        {
+            if (!string.Equals(existing.ResourceId, resourceId, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "重取资源与订单不一致 outTradeNo={OutTradeNo} 订单资源={OrderResource} 本次资源={Requested}",
+                    existing.OutTradeNo, existing.ResourceId, resourceId);
+
+                return new PaidAccessResult
+                {
+                    StatusCode = StatusCodes.Status404NotFound,
+                    Payload = new ErrorBody
+                    {
+                        Code = "RESOURCE_MISMATCH",
+                        Message = "该订单对应的资源与本次请求的资源不一致。"
+                    }
+                };
+            }
+
+            var fastPathRejection = EvaluateClaimIdentity(existing, proof.ClientSession);
+
+            if (fastPathRejection is not null)
+            {
+                return fastPathRejection;
+            }
+
+            _logger.LogInformation(
+                "订单已履约，直接复用落库产出 outTradeNo={OutTradeNo} 版本={Version}（不重复验付）",
+                existing.OutTradeNo,
+                string.IsNullOrWhiteSpace(existing.DeliveredVersion) ? "(未记录)" : existing.DeliveredVersion);
+
+            return Delivered(
+                existing.ResourceId,
+                existing.ServiceResult!,
+                proof.TradeNo,
+                existing.OutTradeNo,
+                alreadyFulfilled: true);
+        }
+
         var outcome = await _gateway.VerifyPaymentAsync(proof, cancellationToken);
 
         if (!outcome.ApiSucceeded)
@@ -294,6 +349,15 @@ public sealed class PaidAccessService
             return await IssuePaymentRequiredAsync(definition, resourceId, cancellationToken);
         }
 
+        // 一致性校验放在金额/资源校验之后、履约之前：
+        // 此时才能确定订单确实属于这笔交易，判定「谁在取货」才有意义。
+        var claimRejection = order is null ? null : EvaluateClaimIdentity(order, proof.ClientSession);
+
+        if (claimRejection is not null)
+        {
+            return claimRejection;
+        }
+
         var outTradeNo = outcome.OutTradeNo!;
 
         // 关键：履约一旦开始，就与买家的 HTTP 连接脱钩。
@@ -317,6 +381,8 @@ public sealed class PaidAccessService
                 TradeNo = verifyTradeNo,
                 ExpectedAmount = AmountRules.Normalize(verifyAmount),
                 ExpectedResourceId = verifiedResourceId,
+                ClientSession = proof.ClientSession,
+                PayloadVersion = definition.ResolvePayloadVersion(),
                 CreateResourceAsync = token =>
                     _resources.CreateAsync(resourceId, outTradeNo, skillCode, inputJson, token)
             },
@@ -414,4 +480,98 @@ public sealed class PaidAccessService
     /// </summary>
     private string NewOutTradeNo() =>
         $"SP{_time.GetUtcNow():yyyyMMddHHmmssfff}{Convert.ToHexString(RandomNumberGenerator.GetBytes(6))}";
+
+    /// <summary>买家会话一致性判定结果。</summary>
+    private enum ClaimIdentityCheck
+    {
+        /// <summary>订单尚未登记会话（本特性上线前的历史订单），无从判定。</summary>
+        Unbound,
+
+        /// <summary>本次请求带来的会话与订单登记值一致。</summary>
+        Matched,
+
+        /// <summary>本次请求带了会话，但与订单登记值不同。</summary>
+        Mismatch,
+
+        /// <summary>订单已登记会话，而本次请求根本没带。</summary>
+        Sessionless
+    }
+
+    /// <summary>
+    /// 校验取货人与付款人是否一致，并按配置模式决定放行还是拒绝。
+    /// </summary>
+    /// <returns>非 <c>null</c> 表示该结果应直接作为响应返回；<c>null</c> 表示放行。</returns>
+    /// <remarks>
+    /// 这里是「订单号 / 交易号泄露后别人也能取货」的堵口点。
+    /// 交易号与订单号都会随付款流程公开流转，只有 <c>client_session</c> 是付款人私有的那部分 ——
+    /// 支付宝官方对该字段的定义即为「买家客户端会话标识，用于验证买家一致性」。
+    /// <para>
+    /// 未绑定会话的历史订单按「无从判定」放行，否则上线当天就会把老买家全部锁死。
+    /// </para>
+    /// </remarks>
+    private PaidAccessResult? EvaluateClaimIdentity(OrderSnapshot order, string? requestSession)
+    {
+        ClaimIdentityCheck check = ClassifyClientSession(order, requestSession);
+
+        if (check is ClaimIdentityCheck.Matched or ClaimIdentityCheck.Unbound)
+        {
+            return null;
+        }
+
+        string reason = check == ClaimIdentityCheck.Sessionless
+            ? "请求未携带 client_session"
+            : "会话标识与订单登记值不一致";
+
+        if (ClaimIdentityModes.IsEnforce(_aipay.ClaimIdentityMode))
+        {
+            _logger.LogWarning(
+                "拒绝取货：{Reason} outTradeNo={OutTradeNo} 订单会话={Bound} 本次会话={Incoming}",
+                reason, order.OutTradeNo, Mask(order.ClientSession), Mask(requestSession));
+
+            // 刻意用 403 而不是 402：402 会诱导智能体重新发起支付，让用户白白多付一笔钱。
+            return new PaidAccessResult
+            {
+                StatusCode = StatusCodes.Status403Forbidden,
+                Payload = new ErrorBody
+                {
+                    Code = "CLAIM_IDENTITY_MISMATCH",
+                    Message = "该订单的取货凭据与当前买家身份不一致，无法交付。请用当初付款的那台客户端重取。"
+                }
+            };
+        }
+
+        if (ClaimIdentityModes.IsObserve(_aipay.ClaimIdentityMode))
+        {
+            // 观察模式：放行但留证 —— 用于判断能否安全收紧到 Enforce。
+            _logger.LogWarning(
+                "取货身份存疑（观察模式，仍放行）：{Reason} outTradeNo={OutTradeNo} 订单会话={Bound} 本次会话={Incoming}",
+                reason, order.OutTradeNo, Mask(order.ClientSession), Mask(requestSession));
+        }
+
+        return null;
+    }
+
+    private static ClaimIdentityCheck ClassifyClientSession(OrderSnapshot order, string? requestSession)
+    {
+        if (string.IsNullOrWhiteSpace(order.ClientSession))
+        {
+            return ClaimIdentityCheck.Unbound;
+        }
+
+        if (string.IsNullOrWhiteSpace(requestSession))
+        {
+            // 订单登记过会话，而本次请求没带 —— 不因「缺参数」放行，否则只要不带这个头就能绕过校验。
+            return ClaimIdentityCheck.Sessionless;
+        }
+
+        return string.Equals(order.ClientSession, requestSession, StringComparison.Ordinal)
+            ? ClaimIdentityCheck.Matched
+            : ClaimIdentityCheck.Mismatch;
+    }
+
+    /// <summary>会话标识只保留前 8 位用于日志；完整值属于买家凭据，不落日志。</summary>
+    private static string Mask(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "(空)"
+        : value.Length <= 8 ? value
+        : value[..8] + "…";
 }

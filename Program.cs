@@ -32,6 +32,14 @@ builder.Services.AddOptions<DeliveryOptions>()
     .ValidateOnStart();
 
 // ---------------------------------------------------------------------------
+// 技能包自更新（公开通道）
+// 技能包本身不收费，谁都能拉最新版；付费门槛只在交付物上。
+// ---------------------------------------------------------------------------
+builder.Services.AddOptions<SkillUpdateOptions>()
+    .Bind(builder.Configuration.GetSection(SkillUpdateOptions.SectionName))
+    .ValidateOnStart();
+
+// ---------------------------------------------------------------------------
 // 订单持久化：SQLite 文件库。订单必须落库，禁止使用进程内存。
 // ---------------------------------------------------------------------------
 string databasePath = ResolveDatabasePath(builder.Configuration, builder.Environment.ContentRootPath);
@@ -116,6 +124,16 @@ static async Task StartupSelfCheckAsync(WebApplication app)
     var db = provider.GetRequiredService<SkillPayDbContext>();
     await db.Database.EnsureCreatedAsync();
 
+    // -----------------------------------------------------------------------
+    // 幂等补列。
+    // EnsureCreatedAsync 只在库不存在时建表，**不会**给已有库补新列；
+    // 而生产库里躺着已付款订单，绝不能推倒重建。因此这里按「缺什么补什么」处理，
+    // 可重复执行：列已存在则原样跳过，数据一行不动。
+    // -----------------------------------------------------------------------
+    await EnsureColumnAsync(db, logger, "DeliveredVersion", "TEXT NULL");
+    await EnsureColumnAsync(db, logger, "ClientSession", "TEXT NULL");
+    await EnsureColumnAsync(db, logger, "ClientSessionBoundAt", "TEXT NULL");
+
     // 解析配置即触发校验器；缺失关键字段会在此处抛错而非运行期失败。
     AipayOptions aipay = provider.GetRequiredService<IOptions<AipayOptions>>().Value;
     SkillCatalogOptions catalog = provider.GetRequiredService<IOptions<SkillCatalogOptions>>().Value;
@@ -141,6 +159,21 @@ static async Task StartupSelfCheckAsync(WebApplication app)
         delivery.FulfillmentTimeoutSeconds,
         delivery.MaxInlinePayloadBytes);
 
+    SkillUpdateOptions skillUpdate = provider.GetRequiredService<IOptions<SkillUpdateOptions>>().Value;
+
+    logger.LogInformation(
+        "技能包自更新：目录={PackageRoot} 已登记技能 {Count} 个：{Skills}",
+        skillUpdate.PackageRoot,
+        skillUpdate.Skills.Count,
+        string.Join(", ", skillUpdate.Skills.Keys));
+
+    logger.LogInformation(
+        "取货身份校验：模式={Mode}{Hint}",
+        aipay.ClaimIdentityMode,
+        ClaimIdentityModes.IsEnforce(aipay.ClaimIdentityMode)
+            ? string.Empty
+            : "（Observe 只记录不拦截，日志确认无误后再切 Enforce）");
+
     foreach ((string code, SkillDefinition definition) in catalog.Skills)
     {
         if (!definition.HasPayload)
@@ -156,4 +189,51 @@ static async Task StartupSelfCheckAsync(WebApplication app)
         logger.LogWarning(
             "当前不是精确沙箱模式，验付将要求支付宝应答字段完整。若尚未签约，请确认 serviceId 与网关配置。");
     }
+}
+
+/// <summary>
+/// 幂等补列：列已存在就跳过，缺了才 <c>ALTER TABLE</c>。
+/// </summary>
+/// <remarks>
+/// 生产库里躺着已付款订单，任何「重建表」的方案都不可接受，因此这里只做加法。
+/// 先 <c>PRAGMA table_info</c> 再决定是否改，可重复执行；
+/// 之所以不写成 <c>ADD COLUMN IF NOT EXISTS</c>，是因为 SQLite 本身不支持这个语法。
+/// </remarks>
+static async Task EnsureColumnAsync(
+    SkillPayDbContext db,
+    ILogger logger,
+    string column,
+    string definition)
+{
+    var connection = db.Database.GetDbConnection();
+
+    if (connection.State != System.Data.ConnectionState.Open)
+    {
+        await connection.OpenAsync();
+    }
+
+    await using (var probe = connection.CreateCommand())
+    {
+        probe.CommandText = "PRAGMA table_info('skillpay_orders');";
+
+        await using var reader = await probe.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            // table_info 的第 2 列（索引 1）是列名。
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+    }
+
+    await using (var alter = connection.CreateCommand())
+    {
+        // 列名与类型都来自代码内常量，不拼接任何外部输入。
+        alter.CommandText = $"ALTER TABLE \"skillpay_orders\" ADD COLUMN \"{column}\" {definition};";
+        await alter.ExecuteNonQueryAsync();
+    }
+
+    logger.LogInformation("订单库已补齐列 {Column}", column);
 }

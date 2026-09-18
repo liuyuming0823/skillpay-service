@@ -54,6 +54,22 @@ public sealed class EfOrderRepository : IOrderRepository
         return record is null ? null : ToSnapshot(record);
     }
 
+    public async Task<OrderSnapshot?> FindByTradeNoAsync(
+        string tradeNo,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(tradeNo))
+        {
+            return null;
+        }
+
+        var record = await _db.Orders
+            .AsNoTracking()
+            .FirstOrDefaultAsync(o => o.TradeNo == tradeNo, cancellationToken);
+
+        return record is null ? null : ToSnapshot(record);
+    }
+
     public async Task<FulfillmentPreparation?> PrepareFulfillmentAsync(
         FulfillmentRequest request,
         CancellationToken cancellationToken = default)
@@ -80,13 +96,16 @@ public sealed class EfOrderRepository : IOrderRepository
         }
 
         // 已进入履约的订单直接复用既有资源，保证同一凭据重试结果一致。
+        // 复用是**产物按订单冻结**的落点：这里的 ServiceResult 是当初那一版，
+        // 之后 payloads/ 下的文件换成什么版本，都与本订单无关。
         if (!string.IsNullOrEmpty(record.ServiceResult) &&
             (record.FulfillStatus == FulfillStatus.PendingConfirm || record.FulfillStatus == FulfillStatus.Fulfilled))
         {
             return new FulfillmentPreparation
             {
                 State = record.FulfillStatus,
-                ServiceResult = record.ServiceResult
+                ServiceResult = record.ServiceResult,
+                DeliveredVersion = record.DeliveredVersion
             };
         }
 
@@ -132,6 +151,18 @@ public sealed class EfOrderRepository : IOrderRepository
         record.TradeNo = request.TradeNo;
         record.OrderStatus = OrderStatus.Paid;
         record.FulfillStatus = FulfillStatus.PendingConfirm;
+        record.DeliveredVersion = request.PayloadVersion;
+
+        // 会话只绑一次、且不覆盖。
+        // 首次履约这一刻，请求方刚被支付宝验付通过，是「谁付的钱」最可信的记录；
+        // 后续任何请求都不应改写它，否则身份校验只需发一次空会话请求就能被抹掉。
+        if (string.IsNullOrWhiteSpace(record.ClientSession)
+            && !string.IsNullOrWhiteSpace(request.ClientSession))
+        {
+            record.ClientSession = request.ClientSession;
+            record.ClientSessionBoundAt = DateTimeOffset.UtcNow;
+        }
+
         record.UpdatedAt = DateTimeOffset.UtcNow;
 
         try
@@ -155,7 +186,8 @@ public sealed class EfOrderRepository : IOrderRepository
                 return new FulfillmentPreparation
                 {
                     State = replay.FulfillStatus,
-                    ServiceResult = replay.ServiceResult
+                    ServiceResult = replay.ServiceResult,
+                    DeliveredVersion = replay.DeliveredVersion
                 };
             }
 
@@ -165,7 +197,8 @@ public sealed class EfOrderRepository : IOrderRepository
         return new FulfillmentPreparation
         {
             State = FulfillStatus.PendingConfirm,
-            ServiceResult = generated
+            ServiceResult = generated,
+            DeliveredVersion = request.PayloadVersion
         };
     }
 
@@ -204,6 +237,9 @@ public sealed class EfOrderRepository : IOrderRepository
         OrderStatus = record.OrderStatus,
         FulfillStatus = record.FulfillStatus,
         TradeNo = record.TradeNo,
-        ServiceResult = record.ServiceResult
+        ServiceResult = record.ServiceResult,
+        DeliveredVersion = record.DeliveredVersion,
+        ClientSession = record.ClientSession,
+        ClientSessionBoundAt = record.ClientSessionBoundAt
     };
 }
