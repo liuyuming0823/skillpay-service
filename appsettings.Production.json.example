@@ -3,6 +3,10 @@
   "//2": "该文件（以及任何填好的 Production 配置）已被 .gitignore 忽略，绝不进版本库。",
   "//3": "应用私钥推荐用环境变量 ALIPAY_PRIVATE_KEY 注入，而不是写在文件里；变量会覆盖此文件同名配置。",
   "//4": "应用私钥必须是 PKCS#1 纯 Base64（无 PEM 头尾）。若填 PKCS#8，服务会在启动时直接报错终止。",
+  "//4b": "ClaimIdentityMode：取货身份校验，比对 Payment-Proof 里的 method.client_session 与订单登记值。",
+  "//4c": "Observe = 只记日志仍照常交付（默认，上线初期用）；Enforce = 不一致即拒绝，返回 403 CLAIM_IDENTITY_MISMATCH。",
+  "//4d": "务必显式写出该键：本文件不出现它就会静默继承 appsettings.json 的默认值（Observe）。",
+  "//4e": "未绑定会话的历史订单（本特性上线前履约的）在任何模式下都放行，不会因切 Enforce 被锁死。",
 
   "Logging": {
     "LogLevel": {
@@ -23,7 +27,8 @@
       "ServiceId": "<服务市场创建服务后返回的真实 serviceId>",
       "Currency": "CNY",
       "SignType": "RSA2",
-      "PayWindowMinutes": 30
+      "PayWindowMinutes": 30,
+      "ClaimIdentityMode": "Observe"
     }
   },
 
