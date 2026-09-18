@@ -332,10 +332,21 @@ def cmd_verify(args):
 # ── 生产部署（走 ssh，默认不执行） ──────────────────────────────────────────
 
 def _ssh_script(script):
-    """把脚本从 stdin 交给远端 bash 执行 —— 避开引号/换行/百分号的转义地狱"""
-    return subprocess.run(
+    """把脚本从 stdin 交给远端 bash 执行 —— 避开引号/换行/百分号的转义地狱
+
+    注意：Windows 上 text=True 会把喂给 stdin 的 \\n 翻译成 \\r\\n，远端 bash
+    读到的是 "set -euo pipefail\\r"，\\r 会让选项名变成无效值，脚本在第 2 行
+    就死掉（报 `set: pipefail: invalid option name`）。所以这里显式以二进制
+    喂 stdin、再手工按 utf-8 解码输出，保持与原来一致的 str 接口。
+    """
+    r = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", PROD_HOST, "bash -s"],
-        input=script, capture_output=True, text=True)
+        input=script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"),
+        capture_output=True)
+    return subprocess.CompletedProcess(
+        r.args, r.returncode,
+        (r.stdout or b"").decode("utf-8", "replace"),
+        (r.stderr or b"").decode("utf-8", "replace"))
 
 
 def _scp(local, remote):
@@ -480,7 +491,7 @@ def cmd_doctor(args):
     print("")
     print("== 生产 %s ==" % PROD_HOST)
     probe = (
-        'echo "SSH_OK"\n'
+        'echo "SSH_OK=SSH_OK"\n'
         'echo "SUDO_NOPASSWD=$(sudo -n true 2>/dev/null && echo yes || echo no)"\n'
         'echo "PAYLOAD_DIR=$(test -d @@DIR@@ && echo yes || echo no)"\n'
         'echo "PAYLOAD_WRITABLE=$(sudo -n test -w @@DIR@@ 2>/dev/null && echo yes || echo no)"\n'
