@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Extensions.Options;
 using SkillPay.Service.Configuration;
 using SkillPay.Service.Domain;
@@ -525,8 +526,8 @@ public sealed class PaidAccessService
         if (ClaimIdentityModes.IsEnforce(_aipay.ClaimIdentityMode))
         {
             _logger.LogWarning(
-                "拒绝取货：{Reason} outTradeNo={OutTradeNo} 订单会话={Bound} 本次会话={Incoming}",
-                reason, order.OutTradeNo, Mask(order.ClientSession), Mask(requestSession));
+                "拒绝取货：{Reason} outTradeNo={OutTradeNo} 订单身份={Bound} 本次身份={Incoming}",
+                reason, order.OutTradeNo, DescribeSession(order.ClientSession), DescribeSession(requestSession));
 
             // 刻意用 403 而不是 402：402 会诱导智能体重新发起支付，让用户白白多付一笔钱。
             return new PaidAccessResult
@@ -544,8 +545,8 @@ public sealed class PaidAccessService
         {
             // 观察模式：放行但留证 —— 用于判断能否安全收紧到 Enforce。
             _logger.LogWarning(
-                "取货身份存疑（观察模式，仍放行）：{Reason} outTradeNo={OutTradeNo} 订单会话={Bound} 本次会话={Incoming}",
-                reason, order.OutTradeNo, Mask(order.ClientSession), Mask(requestSession));
+                "取货身份存疑（观察模式，仍放行）：{Reason} outTradeNo={OutTradeNo} 订单身份={Bound} 本次身份={Incoming}",
+                reason, order.OutTradeNo, DescribeSession(order.ClientSession), DescribeSession(requestSession));
         }
 
         return null;
@@ -564,9 +565,62 @@ public sealed class PaidAccessService
             return ClaimIdentityCheck.Sessionless;
         }
 
+        // ------------------------------------------------------------------
+        // 买家侧的 client_session 是「一次性签名凭据」，形如：
+        //   {"externalId":"…","signature":"…","timestamp":"…"}
+        // 其中 signature 与 timestamp **每次请求都会变**，所以整串比对必然不等 ——
+        // 那会把同一买家的正常重取也判成「异会话」而拒掉。
+        // （2026-09-18 真机实测：一开 Enforce，付款后的重取全部 403。）
+        // 跨请求真正稳定的只有 externalId，故按它比对；
+        // 若两侧不是该形态（旧客户端 / 手工组装凭据），退化为整串比对以保持原语义。
+        // ------------------------------------------------------------------
+        string? boundIdentity = ExtractSessionIdentity(order.ClientSession);
+        string? incomingIdentity = ExtractSessionIdentity(requestSession);
+
+        if (boundIdentity is not null && incomingIdentity is not null)
+        {
+            return string.Equals(boundIdentity, incomingIdentity, StringComparison.Ordinal)
+                ? ClaimIdentityCheck.Matched
+                : ClaimIdentityCheck.Mismatch;
+        }
+
         return string.Equals(order.ClientSession, requestSession, StringComparison.Ordinal)
             ? ClaimIdentityCheck.Matched
             : ClaimIdentityCheck.Mismatch;
+    }
+
+    /// <summary>
+    /// 从 <c>client_session</c> 中取出跨请求稳定的身份子字段 <c>externalId</c>。
+    /// </summary>
+    /// <remarks>
+    /// 该字段是 Base64URL 编码的 JSON（<c>{"externalId":…,"signature":…,"timestamp":…}</c>）。
+    /// 形态不符、解码失败或取不到 <c>externalId</c> 时返回 <c>null</c>，由调用方退化为整串比对。
+    /// </remarks>
+    private static string? ExtractSessionIdentity(string? session)
+    {
+        if (!Base64Url.TryDecode(session, out string decoded))
+        {
+            return null;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(decoded);
+
+            if (document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("externalId", out JsonElement identity)
+                && identity.ValueKind == JsonValueKind.String)
+            {
+                string? value = identity.GetString();
+                return string.IsNullOrWhiteSpace(value) ? null : value;
+            }
+        }
+        catch (JsonException)
+        {
+            // 不是 JSON —— 交给整串比对。
+        }
+
+        return null;
     }
 
     /// <summary>会话标识只保留前 8 位用于日志；完整值属于买家凭据，不落日志。</summary>
@@ -574,4 +628,11 @@ public sealed class PaidAccessService
         string.IsNullOrWhiteSpace(value) ? "(空)"
         : value.Length <= 8 ? value
         : value[..8] + "…";
+
+    /// <summary>
+    /// 日志用的会话描述：优先显示稳定身份（<c>externalId</c>）前缀，取不到时退回整串前缀。
+    /// 整串前缀恒为 <c>eyJleHRl…</c>（都是 base64 的 JSON 开头），没有诊断价值，故优先取身份。
+    /// </summary>
+    private static string DescribeSession(string? session) =>
+        Mask(ExtractSessionIdentity(session) ?? session);
 }
